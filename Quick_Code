@@ -1,0 +1,205 @@
+# Kriging of Water Temperature Data
+# This code performs spatial interpolation using Ordinary Kriging to create seasonal water temperature maps.  
+# Refer to the full report for details on data preprocessing, variogram selection, and results: [https://drive.google.com/file/d/1yXK9QeRNYC_XvNnIGkGfljURp_otVy3G/view?usp=sharing].
+
+# Import necessary libraries
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from pykrige.ok import OrdinaryKriging
+import matplotlib.pyplot as plt
+from shapely.geometry import Point
+
+# Step 1: Load spatial boundary data for Lake Erie
+# The Lake Erie boundary is used to ensure interpolation stays within the lake area
+lake_boundary = gpd.read_file("lake-erie_812.geojson")
+
+# Step 2: Load and clean water temperature data
+# The cleaned data includes water temperature measurements with spatial coordinates
+water_temp = pd.read_csv("cleaned_water_temp.csv")
+water_temp['geometry'] = water_temp.apply(lambda row: Point(row['Longitude'], row['Latitude']), axis=1)
+gdf_temp = gpd.GeoDataFrame(water_temp, geometry='geometry', crs='EPSG:4326')
+
+# Add pseudo-points along the boundary to improve kriging near the edges
+# These points help prevent edge effects during interpolation by providing artificial data constraints
+pseudo_points = lake_boundary.sample(20).copy()
+pseudo_points['Temperature'] = gdf_temp['Temperature'].mean()  # Use mean temperature as a reasonable approximation
+pseudo_gdf = gpd.GeoDataFrame(pseudo_points, geometry=pseudo_points.geometry, crs='EPSG:4326')
+combined_gdf = pd.concat([gdf_temp, pseudo_gdf])
+
+# Step 3: Define the grid for kriging
+# Create a fine grid for interpolation within the lake boundary
+xmin, ymin, xmax, ymax = lake_boundary.total_bounds
+x = np.linspace(xmin, xmax, 200)
+y = np.linspace(ymin, ymax, 200)
+gridx, gridy = np.meshgrid(x, y)
+
+# Step 4: Apply Ordinary Kriging
+# Kriging is used for geostatistical interpolation; the linear variogram model was selected for simplicity
+krige = OrdinaryKriging(
+    combined_gdf['Longitude'], combined_gdf['Latitude'], combined_gdf['Temperature'],
+    variogram_model="linear", verbose=False, enable_plotting=False
+)
+z, ss = krige.execute("grid", gridx, gridy)
+
+# Step 5: Mask kriging output to lake boundary
+# Only include interpolated points within the Lake Erie boundary
+grid_points = [Point(x, y) for x, y in zip(gridx.flatten(), gridy.flatten())]
+grid_gdf = gpd.GeoDataFrame({'Temperature': z.flatten()}, geometry=grid_points, crs='EPSG:4326')
+masked_grid = gpd.sjoin(grid_gdf, lake_boundary, how='inner', predicate='intersects')
+
+# Step 6: Save and visualize the output
+# Generate seasonal kriging maps for water temperature
+years = range(2009, 2023 + 1)  # Adjust this range as needed
+seasons = {'Winter': [12, 1, 2], 'Spring': [3, 4, 5], 'Summer': [6, 7, 8], 'Fall': [9, 10, 11]}
+
+for year in years:
+    for season, months in seasons.items():
+        seasonal_data = combined_gdf[
+            (combined_gdf['Year'] == year) & (combined_gdf['Month'].isin(months))
+        ]
+        if not seasonal_data.empty:
+            # Perform kriging for the seasonal data
+            seasonal_krige = OrdinaryKriging(
+                seasonal_data['Longitude'], seasonal_data['Latitude'], seasonal_data['Temperature'],
+                variogram_model="linear", verbose=False, enable_plotting=False
+            )
+            z_season, ss_season = seasonal_krige.execute("grid", gridx, gridy)
+            
+            # Create a seasonal map
+            plt.figure(figsize=(10, 8))
+            plt.contourf(gridx, gridy, z_season, levels=20, cmap="coolwarm")
+            lake_boundary.boundary.plot(color='black', linewidth=0.5, ax=plt.gca())
+            plt.title(f"{season} Water Temperature Map for {year}")
+            plt.colorbar(label="Temperature (°C)")
+            plt.savefig(f"{season}_{year}_Water_Temperature.png")
+            plt.close()
+
+
+# DBSCAN Analysis of Water Quality and Algal Data
+# This code applies Density-Based Spatial Clustering of Applications with Noise (DBSCAN) to identify spatial clusters and hotspots of water quality parameters (temperature, dissolved oxygen) and algal concentrations (CI_cyano).
+# Refer to the full report for details on data preprocessing, parameter optimization, and clustering results: [https://drive.google.com/file/d/1yXK9QeRNYC_XvNnIGkGfljURp_otVy3G/view?usp=sharing].
+
+#Visualize maps into a panel
+
+%matplotlib inline
+
+import geopandas as gpd
+import pandas as pd
+from rasterstats import zonal_stats
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.ndimage import gaussian_filter
+
+def extract_algal_data(tif_path, shapefile):
+    """Extract algal data from TIFF and join with shapefile."""
+    stats = zonal_stats(shapefile, tif_path, stats=["mean"], geojson_out=True)
+    algal_data = gpd.GeoDataFrame.from_features(stats)
+    algal_data = algal_data.rename(columns={"mean": "Algal"})
+    return algal_data
+
+def perform_hotspot_analysis(data, clusters=5):
+    """Perform clustering analysis on dissolved oxygen, temperature, and algal data."""
+    scaler = StandardScaler()
+    data[['DO', 'Temp', 'Algal']] = scaler.fit_transform(data[['DO', 'Temp', 'Algal']])
+    
+    kmeans = KMeans(n_clusters=clusters, random_state=42)
+    data['cluster'] = kmeans.fit_predict(data[['DO', 'Temp', 'Algal']])
+    return data
+
+def rasterize_clusters(data, lake_boundary, resolution=100):
+    """Rasterize cluster data."""
+    xmin, ymin, xmax, ymax = lake_boundary.total_bounds
+    x = np.linspace(xmin, xmax, resolution)
+    y = np.linspace(ymin, ymax, resolution)
+    xx, yy = np.meshgrid(x, y)
+    
+    grid = np.full((resolution, resolution), -1, dtype=int)
+    
+    for idx, row in data.iterrows():
+        ix = np.argmin(np.abs(x - row.geometry.x))
+        iy = np.argmin(np.abs(y - row.geometry.y))
+        grid[iy, ix] = row['cluster']
+    
+    return grid, (xmin, xmax, ymin, ymax)
+
+# Map seasons to algal quarters
+season_to_quarter = {"DJF": "Q1", "MAM": "Q2", "JJA": "Q3", "SON": "Q4"}
+
+# Load Lake Erie boundary
+lake_boundary = gpd.read_file(f"../Nutrient_Data/lake-erie_812.geojson")
+
+# Define years and seasons
+years = [2011, 2017, 2019, 2022]
+seasons = {"DJF": [12, 1, 2], "MAM": [3, 4, 5], "JJA": [6, 7, 8], "SON": [9, 10, 11]}
+
+# Adjust global font sizes
+plt.rcParams.update({'font.size': 12})  # Default font size for plots
+
+# Create a figure with subplots
+fig, axes = plt.subplots(len(years), len(seasons), figsize=(20, 5 * len(years)))
+fig.suptitle("Rasterized Clusters Comparison Across Years and Seasons", fontsize=24)
+
+# Create a list to store the image objects
+images = []
+
+for i, year in enumerate(years):
+    for j, (season, months) in enumerate(seasons.items()):
+        print(f"Processing {season}, {year}...")
+        
+        # File paths
+        temp_file = f"../Nutrient_Data/shapefile_outputs/lake_erie_{year}_{season}_interpolated.shp"
+        do_file = f"../Nutrient_Data/shapefile_outputs_DO/lake_erie_{year}_{season}_DO_interpolated.shp"
+        algal_tif = f"../Algal_Data/algal_seasonal_spatial/seasonal_avg_{year}-{season_to_quarter[season]}.tif"
+        
+        try:
+            # Load temperature and dissolved oxygen shapefiles
+            temp_data = gpd.read_file(temp_file)
+            do_data = gpd.read_file(do_file)
+            
+            # Rename columns for consistency
+            temp_data = temp_data.rename(columns={"temp": "Temp"})
+            do_data = do_data.rename(columns={"DO": "DO"})
+            
+            # Merge temperature and dissolved oxygen data
+            merged_data = gpd.sjoin(temp_data, do_data, how="inner", predicate="intersects")
+            
+            # Extract algal data
+            algal_data = extract_algal_data(algal_tif, merged_data)
+            merged_data["Algal"] = algal_data["Algal"]
+            
+            # Perform clustering
+            clustered_data = perform_hotspot_analysis(merged_data, clusters=6)  # Adjusted clusters
+            
+            # Rasterize clusters
+            grid, extent = rasterize_clusters(clustered_data, lake_boundary)
+            
+            # Plot rasterized data
+            ax = axes[i, j]
+            smoothed_grid = gaussian_filter(grid, sigma=1)
+            im = ax.imshow(smoothed_grid, extent=extent, origin='lower', cmap='coolwarm', alpha=0.8)
+            images.append(im)
+            lake_boundary.plot(ax=ax, edgecolor="black", facecolor="none", linewidth=1.5)
+            ax.set_title(f"{season} {year}", fontsize=16)  # Larger title font
+            ax.axis("off")
+        except FileNotFoundError:
+            print(f"Missing data for {season}, {year}. Skipping...")
+            axes[i, j].text(0.5, 0.5, f"No data\n{season} {year}", ha='center', va='center', fontsize=14, color="red")
+            axes[i, j].axis("off")
+        except Exception as e:
+            print(f"Error processing {season}, {year}: {e}")
+            axes[i, j].text(0.5, 0.5, f"Error\n{season} {year}", ha='center', va='center', fontsize=14, color="red")
+            axes[i, j].axis("off")
+
+# Adjust the layout to make room for the colorbar
+plt.tight_layout(rect=[0, 0.03, 0.9, 0.95])
+
+# Add a colorbar to the right of the subplots
+cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+cbar = fig.colorbar(images[0], cax=cbar_ax)
+cbar.set_label('Cluster', fontsize=16)
+cbar.ax.tick_params(labelsize=14)  # Increase tick label size
+
+plt.show()
